@@ -1,0 +1,13 @@
+[package]
+name = "smolstr_debug_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smol_str = "0.3.4"
+smallvec = "=2.0.0-alpha.12"
+
+[profile.dev]
+# Ensure debug info is included
+debug = true
+opt-level = 0
