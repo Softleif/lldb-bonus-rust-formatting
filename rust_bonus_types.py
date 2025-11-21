@@ -630,6 +630,165 @@ class SmallVecSyntheticProvider:
         return self.length > 0
 
 
+def OptionSummaryProvider(valobj: SBValue, _dict) -> str:
+    """
+    Summary provider for core::option::Option<T>
+
+    Formats Option<T> as "None" or "Some(value)"
+
+    Args:
+        valobj: The Option<T> value to format
+        _dict: LLDB internal bookkeeping parameter
+
+    Returns:
+        A string representation like "None" or "Some(1.3)"
+    """
+    valobj = valobj.GetNonSyntheticValue()
+
+    # Option is an enum with variants None and Some(T)
+    # Check for $variants$ structure (LLDB's enum encoding)
+    variants = valobj.GetChildMemberWithName("$variants$")
+    if not variants.IsValid():
+        # Try alternative: check for direct variant fields
+        # Some Rust versions encode it differently
+        none_variant = valobj.GetChildMemberWithName("None")
+        some_variant = valobj.GetChildMemberWithName("Some")
+
+        if none_variant.IsValid():
+            return "None"
+        elif some_variant.IsValid():
+            # Get the inner value
+            inner = some_variant.GetChildAtIndex(0)
+            if inner.IsValid():
+                return "Some(%s)" % inner.GetValue()
+            return "Some(...)"
+
+        # Fallback: try to get summary from first child
+        if valobj.GetNumChildren() > 0:
+            first_child = valobj.GetChildAtIndex(0)
+            if first_child.IsValid():
+                return first_child.GetSummary() or str(first_child.GetValue() or "")
+
+        return "<Option>"
+
+    # Standard discriminant-based enum
+    # Look for discriminant in various possible locations
+    discr_field = None
+
+    # Try $discr$ at the variants level
+    discr_field = variants.GetChildMemberWithName("$discr$")
+
+    # Try looking in variant structures
+    if not discr_field or not discr_field.IsValid():
+        for i in range(variants.GetNumChildren()):
+            child = variants.GetChildAtIndex(i)
+            discr_candidate = child.GetChildMemberWithName("$discr$")
+            if discr_candidate and discr_candidate.IsValid():
+                discr_field = discr_candidate
+                break
+
+    if not discr_field or not discr_field.IsValid():
+        # Try direct variant access
+        variant0 = variants.GetChildMemberWithName("$variant$0")
+        variant1 = variants.GetChildMemberWithName("$variant$1")
+        variant_unnamed = variants.GetChildMemberWithName("$variant$")
+
+        # Check for niche-optimized Option (e.g., Option<String>)
+        # These use $variant$ (unnamed) for Some and $variant$0 for discriminant
+        if variant0 and variant0.IsValid():
+            discr = variant0.GetChildMemberWithName("$discr$")
+            if discr and discr.IsValid():
+                discr_val = discr.GetValueAsUnsigned()
+                if discr_val == 0:
+                    return "None"
+                elif variant_unnamed and variant_unnamed.IsValid():
+                    # Some variant in unnamed variant
+                    value = variant_unnamed.GetChildMemberWithName("value")
+                    if value and value.IsValid():
+                        inner = value.GetChildAtIndex(0)
+                        if inner.IsValid():
+                            inner_val = inner.GetValue()
+                            if inner_val:
+                                return "Some(%s)" % inner_val
+                            # Try getting the summary instead
+                            inner_summary = inner.GetSummary()
+                            if inner_summary:
+                                return "Some(%s)" % inner_summary
+                            return "Some(...)"
+
+        if variant1 and variant1.IsValid():
+            # Likely Some variant
+            value = variant1.GetChildMemberWithName("value")
+            if value and value.IsValid():
+                inner = value.GetChildAtIndex(0)
+                if inner.IsValid():
+                    inner_val = inner.GetValue()
+                    if inner_val:
+                        return "Some(%s)" % inner_val
+                    # Try getting the summary instead
+                    inner_summary = inner.GetSummary()
+                    if inner_summary:
+                        return "Some(%s)" % inner_summary
+                    return "Some(...)"
+
+        return "<Option>"
+
+    discriminant = discr_field.GetValueAsUnsigned()
+
+    # Check for niche optimization: discriminant with high bit set often indicates None
+    # For 64-bit: 0x8000000000000000, for 32-bit: 0x80000000
+    is_niche_none = discriminant >= 0x8000000000000000
+
+    # Discriminant 0 is typically None for simple types
+    # For niche-optimized types, high bit set means None
+    if discriminant == 0 or is_niche_none:
+        return "None"
+    else:
+        # For niche-optimized types, check $variant$ (unnamed)
+        variant_unnamed = variants.GetChildMemberWithName("$variant$")
+        if variant_unnamed and variant_unnamed.IsValid():
+            value = variant_unnamed.GetChildMemberWithName("value")
+            if value and value.IsValid():
+                inner = value.GetChildAtIndex(0)
+                if inner.IsValid():
+                    inner_val = inner.GetValue()
+                    if inner_val:
+                        return "Some(%s)" % inner_val
+                    inner_summary = inner.GetSummary()
+                    if inner_summary:
+                        return "Some(%s)" % inner_summary
+                    return "Some(...)"
+
+        # Get the Some variant value from $variant$1
+        variant1 = variants.GetChildMemberWithName("$variant$1")
+        if not variant1 or not variant1.IsValid():
+            variant1 = variants.GetChildMemberWithName("Some")
+
+        if variant1 and variant1.IsValid():
+            # The value is typically in a field named "value" or "__0"
+            value = variant1.GetChildMemberWithName("value")
+            if not value or not value.IsValid():
+                value = variant1.GetChildMemberWithName("__0")
+
+            if value and value.IsValid():
+                # Get the actual inner value
+                inner_val = value.GetValue()
+                if inner_val:
+                    return "Some(%s)" % inner_val
+
+                # Try summary if value is not directly available
+                inner_summary = value.GetSummary()
+                if inner_summary:
+                    return "Some(%s)" % inner_summary
+
+                # For complex types, just indicate Some
+                return "Some(...)"
+
+        return "Some(...)"
+
+    return "<Option>"
+
+
 def __lldb_init_module(debugger: lldb.SBDebugger, _internal_dict):
     """
     This function is called by LLDB when the module is loaded.
@@ -685,4 +844,14 @@ def __lldb_init_module(debugger: lldb.SBDebugger, _internal_dict):
     synth.SetOptions(lldb.eTypeOptionCascade)
     category.AddTypeSynthetic(synth_options, synth)
 
-    print("✓ Rust bonus types loaded: SmolStr, SmallVec")
+    # Register Option<T> summary provider
+    option_summary_options = lldb.SBTypeNameSpecifier(
+        "^core::option::Option<.+>$", lldb.eFormatterMatchRegex
+    )
+    option_summary = lldb.SBTypeSummary.CreateWithFunctionName(
+        "rust_bonus_types.OptionSummaryProvider"
+    )
+    option_summary.SetOptions(lldb.eTypeOptionCascade)
+    category.AddTypeSummary(option_summary_options, option_summary)
+
+    print("✓ Rust bonus types loaded: SmolStr, SmallVec, Option")
